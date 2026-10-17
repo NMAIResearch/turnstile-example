@@ -1,0 +1,16 @@
+{
+ "purpose": "Settings for turnstile.py, a shared GPU queue and worker slots for one workstation. Windows are local times. RAM figures are GiB: each job runs in its own memory group capped at job_ram_gib (workers at worker_ram_gib) unless it asks for up to ram_cap_max_gib, and starts only when its cap fits in available memory beside ram_reserve_gib. A window keeps other GPU jobs from starting into it, and stays shut while any of its units (systemd user services) is running or cannot be read, so a late or long scheduled run keeps the GPU. A short run still going at its deadline with no normal slot free is asked to stop, then ended stop_grace_seconds later. The windows list starts empty; see the README for an example.",
+ "normal_slots": 6,
+ "short_slots": 2,
+ "short_max_minutes": 15,
+ "stop_grace_seconds": 30,
+ "poll_seconds": 5,
+ "memory_margin_mib": 512,
+ "memory_groups": true,
+ "job_ram_gib": 24,
+ "worker_ram_gib": 8,
+ "ram_cap_max_gib": 44,
+ "ram_reserve_gib": 12,
+ "swap_cap_gib": 4,
+ "windows": []
+}

@@ -1,0 +1,15 @@
+{
+ "purpose": "Projects whose GPU jobs may use turnstile.py's research class (with --project and --task). A project whose lane is support, or whose status is closed, is refused.",
+ "projects": [
+  {
+   "id": "example-project",
+   "lane": "research",
+   "status": "active"
+  },
+  {
+   "id": "example-support-tool",
+   "lane": "support",
+   "status": "active"
+  }
+ ]
+}
