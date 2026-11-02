@@ -1,15 +1,15 @@
 # Licences
 
-Turnstile (worked example), shared by NM AI Research.
+Turnstile (worked example), shared by NMAI Research.
 
 - **Documents** (`README.md` and this file's text above the MIT licence): Creative Commons Attribution 4.0 International
   (CC BY 4.0), https://creativecommons.org/licenses/by/4.0/. You may share and adapt them for any purpose, with credit to
-  NM AI Research and a link to the licence.
+  NMAI Research and a link to the licence.
 - **Code** (`turnstile.py`, `turnstile.json`, `registry.json` and `tests/`): the MIT licence below.
 
 ## MIT licence (code)
 
-Copyright (c) 2026 NM AI Research
+Copyright (c) 2026 NMAI Research
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
