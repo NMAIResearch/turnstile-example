@@ -225,6 +225,29 @@ class Process(unittest.TestCase):
         self.addCleanup(self.reap, p)
         return p
 
+    def paused_job(self, function):
+        ready, resume, finish = self.tmp / "admission-ready", self.tmp / "resume", self.tmp / "finish"
+        output = self.tmp / "launcher.txt"
+        wrapper = (f"import sys, time\nfrom pathlib import Path\nsys.path.insert(0, {str(TOOL.parent)!r})\n"
+                   f"import turnstile as t\noriginal = t.{function}\n"
+                   f"def pause(*args):\n    Path({str(ready)!r}).touch()\n    end = time.monotonic() + 10\n"
+                   f"    while not Path({str(resume)!r}).exists():\n"
+                   "        if time.monotonic() > end: raise RuntimeError('admission barrier timeout')\n"
+                   "        time.sleep(0.01)\n    return original(*args)\n"
+                   f"t.{function} = pause\nraise SystemExit(t.main(sys.argv[1:]))\n")
+        job = (f"import time\nfrom pathlib import Path\nPath({str(self.events)!r}).touch()\n"
+               f"end = time.monotonic() + 10\nwhile not Path({str(finish)!r}).exists():\n"
+               "    if time.monotonic() > end: raise RuntimeError('job barrier timeout')\n    time.sleep(0.01)\n")
+        with output.open("w") as out:
+            p = subprocess.Popen([sys.executable, "-c", wrapper, "run", "--class", "other", "--mem", "1", "--max", "1",
+                                  "--owner", "paused", "--", sys.executable, "-c", job],
+                                 env=self.env, stdout=out, stderr=subprocess.STDOUT)
+        self.addCleanup(self.reap, p)
+        self.addCleanup(finish.touch)
+        self.addCleanup(resume.touch)
+        self.wait_for(ready)
+        return p, resume, finish, output
+
     def worker(self, name, kind, minutes, command):
         cmd = [sys.executable, str(TOOL), "worker", "--kind", kind, "--max", str(minutes), "--owner", name, "--", *command]
         p = subprocess.Popen(cmd, env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -285,6 +308,51 @@ class Process(unittest.TestCase):
         subprocess.run([sys.executable, str(TOOL), "release"], env=self.env, check=True, capture_output=True)
         self.assertEqual(p.wait(timeout=30), 0)
         self.assertTrue(self.events.exists())
+
+    def test_hold_before_final_admission_keeps_the_job_waiting(self):
+        p, resume, finish, output = self.paused_job("gpu_memory")
+        held = subprocess.run([sys.executable, str(TOOL), "hold"], env=self.env, check=True, capture_output=True, text=True)
+        self.assertIn("Nothing is running", held.stdout)
+        resume.touch()
+        until = time.monotonic() + 5
+        while "the owner holds the GPU" not in output.read_text() and time.monotonic() < until:
+            time.sleep(0.01)
+        self.assertIn("the owner holds the GPU", output.read_text())
+        self.assertFalse(self.events.exists())
+        self.assertIsNone(p.poll())
+        self.assertIn("ready, no Turnstile job is running", self.status())
+        subprocess.run([sys.executable, str(TOOL), "release"], env=self.env, check=True, capture_output=True)
+        self.wait_for(self.events)
+        finish.touch()
+        self.assertEqual(p.wait(timeout=30), 0)
+
+    def test_hold_during_final_admission_waits_for_the_holder(self):
+        p, resume, finish, _output = self.paused_job("grouped")
+        requested = self.tmp / "hold-requested"
+        wrapper = (f"import sys\nfrom pathlib import Path\nsys.path.insert(0, {str(TOOL.parent)!r})\n"
+                   f"import turnstile\nPath({str(requested)!r}).touch()\nraise SystemExit(turnstile.main(['hold']))\n")
+        held = subprocess.Popen([sys.executable, "-c", wrapper], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.reap, held)
+        try:
+            self.wait_for(requested)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                held.wait(timeout=0.2)
+            resume.touch()
+            stdout, stderr = held.communicate(timeout=30)
+            self.assertEqual(held.returncode, 0, stderr)
+            self.assertIn("Still running: paused", stdout)
+            self.assertNotIn("Nothing is running", stdout)
+            self.wait_for(self.events)
+            self.assertIn("not ready yet, paused is still running", self.status())
+            finish.touch()
+            self.assertEqual(p.wait(timeout=30), 0)
+        finally:
+            resume.touch()
+            finish.touch()
+            if held.poll() is None:
+                held.kill()
+            held.communicate(timeout=30)
 
     def test_waits_for_memory(self):
         self.free.write_text("1000")
@@ -628,6 +696,44 @@ class Process(unittest.TestCase):
         self.assertTrue(ghost.exists())  # status only reads
         self.assertEqual(self.job("after", seconds=0.1).wait(timeout=60), 0)
         self.assertFalse(ghost.exists())  # a waiting job removes a ticket whose launcher has gone
+
+    def test_a_reused_queue_pid_is_ignored_and_its_ticket_removed(self):
+        state = self.tmp / "state"
+        queue = state / "queue"
+        queue.mkdir(parents=True)
+        ghost = queue / "stale.json"
+        record = {"id": "stale", "class": "scheduled", "pid": os.getpid(), "pid_started": "0", "enqueued_at": "0",
+                  "owner": "ghost", "mem_mib": 1, "max_minutes": 1}
+        ghost.write_text(json.dumps(record))
+        self.assertTrue(turnstile.alive(record["pid"]))
+        self.assertFalse(turnstile.running(record["pid"], record["pid_started"]))
+        before = self.snapshot(state)
+        self.assertIn("Waiting: 0", self.status())
+        self.assertEqual(self.snapshot(state), before)
+        self.assertEqual(self.job("after", seconds=0.1).wait(timeout=30), 0)
+        self.assertFalse(ghost.exists())
+        self.assertTrue(any(e["event"] == "stale_ticket_removed" and e["ticket"] == "stale" for e in self.log_events()))
+
+    def test_live_queue_tickets_keep_their_place_with_or_without_a_saved_start(self):
+        state = self.tmp / "state"
+        queue = state / "queue"
+        queue.mkdir(parents=True)
+        live = queue / "live.json"
+        started = turnstile.proc_start(os.getpid())
+        self.assertIsNotNone(started)
+        for identity in ({"pid_started": started}, {}):
+            with self.subTest(identity=identity):
+                record = {"id": "live", "class": "scheduled", "pid": os.getpid(), "enqueued_at": "0",
+                          "owner": "waiting", "mem_mib": 1, "max_minutes": 1, **identity}
+                live.write_text(json.dumps(record))
+                before = self.snapshot(state)
+                self.assertIn("Waiting: 1", self.status())
+                with mock.patch.object(turnstile, "STATE", state):
+                    self.assertEqual(turnstile.tickets(clean=False), [record])
+                    self.assertEqual(turnstile.tickets(), [record])
+                    with mock.patch.object(turnstile, "proc_start", return_value=None):
+                        self.assertEqual(turnstile.tickets(), [record])
+                self.assertEqual(self.snapshot(state), before)
 
     @staticmethod
     def snapshot(folder):

@@ -319,7 +319,7 @@ def tickets(clean: bool = True) -> list[dict]:
             t = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not alive(t["pid"]):
+        if not running(t["pid"], t.get("pid_started")):
             if clean:
                 p.unlink(missing_ok=True)
                 log("stale_ticket_removed", ticket=t["id"], owner=t.get("owner"))
@@ -660,23 +660,25 @@ def cmd_run(a) -> int:
             except BlockingIOError:
                 reason = "the GPU is running another job"
             else:
-                # Decide again while holding the lock: a hold, an earlier-ranked job or a reserved run may have arrived.
-                reason = blocked()
-                if reason is None:
-                    break
+                # Hold and final admission share this lock until the holder is published.
+                with open(STATE / "admission.lock", "a") as admission:
+                    fcntl.flock(admission, fcntl.LOCK_EX)
+                    reason = blocked()
+                    if reason is None:
+                        ticket.unlink(missing_ok=True)
+                        started = now()
+                        unit = f"turnstile-gpu-{t['id']}"
+                        cmd, scope = grouped(cfg, unit, ram, a.command)
+                        record = {**t, "unit": unit, "scope": scope, "started_at": started.isoformat(timespec="seconds"),
+                                  "expected_finish": (started + dt.timedelta(minutes=a.max)).isoformat(timespec="seconds")}
+                        holder = STATE / "holder.json"
+                        write_json(holder, record)
+                        break
                 fcntl.flock(lock, fcntl.LOCK_UN)
         if reason != last:
             print(f"turnstile: waiting: {reason}", file=sys.stderr, flush=True)
             last = reason
         time.sleep(cfg.get("poll_seconds", 5))
-    ticket.unlink(missing_ok=True)
-    started = now()
-    unit = f"turnstile-gpu-{t['id']}"
-    cmd, scope = grouped(cfg, unit, ram, a.command)
-    record = {**t, "unit": unit, "scope": scope, "started_at": started.isoformat(timespec="seconds"),
-              "expected_finish": (started + dt.timedelta(minutes=a.max)).isoformat(timespec="seconds")}
-    holder = STATE / "holder.json"
-    write_json(holder, record)
     log("started", ticket=t["id"], owner=a.owner, cls=a.cls, project=a.project, ram_gib=ram)
     try:
         return run_child(cmd, a.max, record, unit=scope, keep=(lock.fileno(),), on_start=lambda: write_json(holder, record))
@@ -911,9 +913,11 @@ def cmd_status(_a) -> int:
 
 def cmd_hold(a) -> int:
     STATE.mkdir(parents=True, exist_ok=True)
-    write_json(STATE / "hold.json", {"since": now().isoformat(timespec="seconds"), "note": a.note})
-    log("hold", note=a.note)
-    held, holder = record_state(STATE / "holder.json")
+    with open(STATE / "admission.lock", "a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        write_json(STATE / "hold.json", {"since": now().isoformat(timespec="seconds"), "note": a.note})
+        log("hold", note=a.note)
+        held, holder = record_state(STATE / "holder.json")
     if held == "unreadable":
         after = f" The GPU holder record cannot be read ({STATE / 'holder.json'}); no GPU job starts until it is removed."
     elif held == "ok" and job_alive(holder):
